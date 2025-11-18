@@ -228,4 +228,3 @@ twine.cfg
 # uv.lock  # Uncomment if you want to ignore uv.lock
 
 .claude
-CLAUDE.md
