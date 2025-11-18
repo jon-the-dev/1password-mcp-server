@@ -1,0 +1,142 @@
+[
+  {
+    "title": "[CRITICAL] C-1: Credential Bypass in Secure Memory Protection",
+    "labels": ["security", "critical", "bug"],
+    "body": "**File:** `onepassword_mcp_server/server.py`\n**Lines:** 364-385\n\n**Description:**\nThe secure memory protection is bypassed when credentials are returned. After wrapping the password in a `SecureString` context, the code immediately extracts it with `secure_password.get_value()` and returns it in a plain dictionary, completely defeating the purpose of secure memory management.\n\n```python\n# Lines 364-375\nif security_manager:\n    with security_manager.secure_credential_context(password) as secure_password:\n        # Return credentials with secure handling\n        return {\n            \"username\": username,\n            \"password\": secure_password.get_value(),  # ❌ Defeats secure memory!\n            ...\n        }\n```\n\n**Impact:**\n- Credentials remain in plaintext in Python memory\n- No protection against memory dumps or core dumps\n- SecureString cleanup happens before credentials are used\n- False sense of security\n\n**Recommendation:**\nEither:\n1. Return the `SecureString` object directly and require callers to extract values when needed, OR\n2. Document that secure memory is not actually protecting returned credentials and remove the misleading implementation, OR\n3. Implement true end-to-end secure memory by keeping credentials encrypted until the final use point\n\n**Priority:** CRITICAL - Fix immediately"
+  },
+  {
+    "title": "[CRITICAL] C-2: No Authentication or Authorization for MCP Tools",
+    "labels": ["security", "critical", "enhancement"],
+    "body": "**File:** `onepassword_mcp_server/server.py`\n**Lines:** 1384-1478 (tool registrations)\n\n**Description:**\nThe MCP server has NO authentication or authorization mechanism beyond the 1Password service account token. Any process that can connect to the MCP server can:\n- Retrieve any credential from any accessible vault\n- Access health status and metrics\n- Execute destructive operations (if enabled)\n\n**Impact:**\n- Any local process can access credentials\n- No user accountability or audit trail\n- No way to restrict which AI assistant or user can access which credentials\n- Violates principle of least privilege\n\n**Recommendation:**\nImplement at minimum:\n1. **Authentication layer**: Require API keys or tokens for MCP tool access\n2. **Authorization layer**: Role-based access control (RBAC) for vaults and operations\n3. **Audit logging**: Track WHICH user/client accessed WHICH credentials WHEN\n4. **Session management**: Time-limited access tokens\n\n**Priority:** CRITICAL - Required for production use"
+  },
+  {
+    "title": "[CRITICAL] C-3: Service Account Token Stored in Plaintext Memory",
+    "labels": ["security", "critical", "bug"],
+    "body": "**File:** `onepassword_mcp_server/config.py`\n**Lines:** 170, 220, 246\n\n**Description:**\nThe 1Password service account token is:\n1. Loaded from environment variables into a Python string (immutable, cannot be cleared)\n2. Stored in the `ServerConfig` dataclass without any memory protection\n3. Passed around the application in plaintext\n4. Never cleared from memory\n\n```python\n# Line 220\nservice_account_token = os.getenv(\"OP_SERVICE_ACCOUNT_TOKEN\")  # Plaintext string\n\n# Line 170\nservice_account_token: Optional[str] = None  # No secure storage\n```\n\n**Impact:**\n- Token exposed in memory dumps\n- Token exposed in crash dumps\n- Token may be swapped to disk\n- Token visible in debuggers and profilers\n\n**Recommendation:**\n1. Use `SecureString` for the service account token\n2. Implement memory locking (mlock/VirtualLock) for the token\n3. Clear token from memory on shutdown\n4. Consider using environment variable only at startup, then clearing it\n\n**Priority:** CRITICAL - Especially for production deployments"
+  },
+  {
+    "title": "[HIGH] H-1: Plaintext Password Logging in Debug Mode",
+    "labels": ["security", "high", "bug"],
+    "body": "**File:** `onepassword_mcp_server/server.py`\n**Lines:** 332-342\n\n**Description:**\nIn debug mode, the code logs the complete 1Password reference paths including vault and item names. While not logging the actual password, this reveals the vault structure and credential locations.\n\n```python\nlogger.debug(\n    \"Retrieving credentials from 1Password\",\n    operation=\"resolve_credentials\",\n    metadata={\n        \"username_ref\": username_ref,  # op://VaultName/ItemName/username\n        \"password_ref\": password_ref    # op://VaultName/ItemName/password\n    }\n)\n```\n\n**Impact:**\n- Information leakage about credential organization\n- Potential reconnaissance for attackers\n- Logs may be sent to external logging services\n\n**Recommendation:**\n- Remove or redact vault and item names from debug logs\n- Only log operation types, not specific references\n- Add configuration flag to control debug verbosity\n\n**Priority:** HIGH"
+  },
+  {
+    "title": "[HIGH] H-2: Incomplete Sensitive Data Scrubbing",
+    "labels": ["security", "high", "bug"],
+    "body": "**File:** `onepassword_mcp_server/structured_logging.py`\n**Lines:** 64-122\n\n**Description:**\nThe sensitive data scrubber has multiple weaknesses:\n\n1. **Exact key matching only** (line 86): Only scrubs if the key name exactly matches patterns\n2. **Limited pattern coverage** (lines 66-70): Missing common patterns like `credential`, `auth_token`, `access_key`\n3. **No value-based detection**: Cannot detect sensitive data by content (e.g., JWT tokens, API keys)\n4. **Regex bypass** (lines 105-111): Complex regex can be bypassed with unusual formatting\n\n```python\ndef _is_sensitive_key(self, key: str) -> bool:\n    \"\"\"Check if key indicates sensitive data\"\"\"\n    key_lower = key.lower()\n\n    # Always scrub certain fields\n    if key_lower in self.always_scrub:  # ❌ Only exact matches\n        return True\n```\n\n**Impact:**\n- Sensitive data may leak through logs\n- Credentials could be exposed with creative key names\n- Third-party logging aggregators may receive secrets\n\n**Recommendation:**\n1. Add fuzzy matching for key names (substring matching)\n2. Implement value-based detection (entropy analysis, format recognition)\n3. Add more patterns: `credential`, `bearer`, `auth_header`, `x-api-key`\n4. Scrub all values >20 chars with high entropy by default\n\n**Priority:** HIGH"
+  },
+  {
+    "title": "[HIGH] H-3: Request Signing Not Actually Verified",
+    "labels": ["security", "high", "bug"],
+    "body": "**File:** `onepassword_mcp_server/security_hardening.py`\n**Lines:** 284-297, `server.py` lines 298-300\n\n**Description:**\nThe code implements request signing but never actually VERIFIES signatures on incoming requests. The `create_secure_request_context` adds a signature, but there's no enforcement that requests must have valid signatures.\n\n```python\n# security_hardening.py - Signs requests\ndef create_secure_request_context(self, request_data: Dict[str, Any]) -> Dict[str, Any]:\n    signature = self.request_signer.sign_request(enhanced_request)\n    enhanced_request[\"signature\"] = signature\n    return enhanced_request\n\n# ❌ But server.py never calls validate_request_context!\n```\n\n**Impact:**\n- Request tampering possible\n- Replay attacks possible\n- No integrity verification\n- Security theater (looks secure but isn't)\n\n**Recommendation:**\n1. Add middleware to verify ALL incoming request signatures\n2. Reject requests with missing or invalid signatures\n3. Implement nonce/timestamp checking to prevent replay attacks\n4. Add signature verification to the MCP tool handlers\n\n**Priority:** HIGH"
+  },
+  {
+    "title": "[HIGH] H-4: Timestamp-Based Signature Vulnerable to Replay Attacks",
+    "labels": ["security", "high", "bug"],
+    "body": "**File:** `onepassword_mcp_server/security_hardening.py`\n**Lines:** 299-309\n\n**Description:**\nThe request signing uses current timestamp but doesn't validate timestamp freshness or prevent replay attacks:\n\n```python\ndef _canonicalize_request(self, request_data: Dict[str, Any]) -> str:\n    canonical_json = json.dumps(request_data, sort_keys=True, separators=(',', ':'))\n    timestamp = str(int(time.time()))  # ❌ No validation on receiving end\n    return f\"{canonical_json}|{timestamp}\"\n```\n\n**Impact:**\n- Signed requests can be replayed indefinitely\n- Old signatures remain valid forever\n- No protection against MITM replay attacks\n\n**Recommendation:**\n1. Implement nonce-based signatures (one-time use tokens)\n2. Add timestamp validation with maximum age (e.g., 5 minutes)\n3. Maintain a cache of recently used nonces\n4. Reject requests with timestamps too old or in the future\n\n**Priority:** HIGH"
+  },
+  {
+    "title": "[HIGH] H-5: Global Mutable State in Concurrent Environment",
+    "labels": ["security", "high", "bug", "technical-debt"],
+    "body": "**File:** `onepassword_mcp_server/server.py`\n**Lines:** 68-77\n\n**Description:**\nThe server uses global mutable variables for critical components:\n\n```python\nconfig: Optional[ServerConfig] = None\nlogger = None\nmetrics_collector = None\nsecure_client: Optional[OnePasswordSecureClient] = None\n# ... etc\n```\n\n**Impact:**\n- Race conditions in async context\n- State corruption if multiple initializations occur\n- Difficult to test and mock\n- Not thread-safe\n\n**Recommendation:**\n1. Use dependency injection instead of globals\n2. Implement singleton pattern with thread locking\n3. Use `contextvars` for request-scoped state\n4. Make components immutable after initialization\n\n**Priority:** HIGH"
+  },
+  {
+    "title": "[HIGH] H-6: Inadequate Input Validation - ReDoS Vulnerability",
+    "labels": ["security", "high", "bug"],
+    "body": "**File:** `onepassword_mcp_server/config.py`\n**Lines:** 87, 248\n\n**Description:**\nThe regex pattern for item/vault names is vulnerable to Regular Expression Denial of Service (ReDoS):\n\n```python\nallowed_item_name_pattern: str = r'^[a-zA-Z0-9._-]+$'  # ❌ Vulnerable to ReDoS\n```\n\nWhile this specific pattern is relatively safe, there's no timeout protection and no maximum length enforcement before regex matching.\n\n**Impact:**\n- CPU exhaustion with crafted input\n- Denial of service\n- Slow response times\n\n**Recommendation:**\n1. Enforce maximum length BEFORE regex matching (currently after)\n2. Add regex timeout protection\n3. Use compiled regex patterns for performance\n4. Consider using simple character whitelisting instead of regex\n\n**Priority:** HIGH"
+  },
+  {
+    "title": "[HIGH] H-7: Error Messages Leak Internal Information",
+    "labels": ["security", "high", "bug"],
+    "body": "**File:** `onepassword_mcp_server/server.py`\n**Lines:** 751-800\n\n**Description:**\nError messages reveal detailed internal information:\n\n```python\n# Line 751\nerror_msg = f\"Invalid input parameters: {str(e)}\"\n\n# Line 792\nerror_msg = f\"Unexpected error retrieving credentials: {str(e)}\"\n```\n\n**Impact:**\n- Information disclosure about internal structure\n- Stack traces may leak file paths and logic\n- Helps attackers understand the system\n- PII or sensitive data in exception messages\n\n**Recommendation:**\n1. Return generic error messages to users\n2. Log detailed errors server-side only\n3. Implement error code system (e.g., ERR001, ERR002)\n4. Never include exception details in user-facing messages\n\n**Priority:** HIGH"
+  },
+  {
+    "title": "[MEDIUM] M-1: SecureString Memory Clearing Inefficiency",
+    "labels": ["security", "medium", "enhancement"],
+    "body": "**File:** `onepassword_mcp_server/security_hardening.py`\n**Lines:** 208-220\n\n**Description:**\nThe memory clearing process is inefficient and may be optimized away by the compiler:\n\n```python\ndef _clear_memory(self):\n    # Overwrite with random data\n    for i in range(len(self._data)):\n        self._data[i] = secrets.randbits(8)  # ❌ Slow\n\n    # Overwrite with zeros\n    for i in range(len(self._data)):\n        self._data[i] = 0\n```\n\n**Impact:**\n- Performance overhead\n- Compiler may optimize away the zeroing\n- Multiple passes may be overkill or insufficient\n\n**Recommendation:**\n1. Use platform-specific secure zero functions (e.g., `explicit_bzero`, `SecureZeroMemory`)\n2. Implement single-pass clearing with cryptographically secure method\n3. Consider using `ctypes` to access OS-level secure clearing\n\n**Priority:** MEDIUM"
+  },
+  {
+    "title": "[MEDIUM] M-2: Cipher Suite Configuration Without Validation",
+    "labels": ["security", "medium", "bug"],
+    "body": "**File:** `onepassword_mcp_server/security_hardening.py`\n**Lines:** 74-79, 334-335\n\n**Description:**\nThe code accepts cipher suite configuration but doesn't validate that they're:\n1. Actually supported by the system\n2. Considered secure by current standards\n3. Compatible with the TLS version\n\n```python\nallowed_cipher_suites: List[str] = field(default_factory=lambda: [\n    \"ECDHE-RSA-AES256-GCM-SHA384\",  # ❌ No validation these exist\n    \"ECDHE-RSA-AES128-GCM-SHA256\",\n    ...\n])\n```\n\n**Impact:**\n- Server may fail to start with invalid ciphers\n- Weak ciphers may be accepted\n- Configuration errors go undetected\n\n**Recommendation:**\n1. Validate cipher suites at startup\n2. Maintain allowlist of approved modern ciphers\n3. Reject known-weak ciphers (DES, RC4, MD5, etc.)\n4. Warn about deprecated but currently acceptable ciphers\n\n**Priority:** MEDIUM"
+  },
+  {
+    "title": "[MEDIUM] M-3: Rate Limiting Per Default Client Only",
+    "labels": ["security", "medium", "enhancement"],
+    "body": "**File:** `onepassword_mcp_server/server.py`\n**Lines:** 127-152, 303\n\n**Description:**\nRate limiting uses a default client ID:\n\n```python\ndef is_allowed(self, client_id: str = \"default\") -> Tuple[bool, int]:\n```\n\nBut the code always uses the default:\n\n```python\n# Line 303\nallowed, remaining = self.rate_limiter.is_allowed()  # ❌ No client_id passed\n```\n\n**Impact:**\n- ALL clients share the same rate limit\n- No per-user rate limiting\n- Easy to bypass by spawning multiple processes\n- Cannot track which client is causing load\n\n**Recommendation:**\n1. Implement client identification mechanism\n2. Use separate rate limits per client\n3. Add configuration for global vs per-client limits\n4. Consider IP-based or session-based limiting\n\n**Priority:** MEDIUM"
+  },
+  {
+    "title": "[MEDIUM] M-4: File Permission Check Incomplete",
+    "labels": ["security", "medium", "bug"],
+    "body": "**File:** `onepassword_mcp_server/security_hardening.py`\n**Lines:** 425-431\n\n**Description:**\nThe file permission check only validates \"others\" readable bit, not group:\n\n```python\nif stat_info.st_mode & 0o044:  # ❌ Only checks others, not group\n    issues.append(f\"Sensitive file '{filename}' is world-readable\")\n```\n\n**Impact:**\n- Files readable by group are not detected\n- Files writable by others/group not checked\n- Incomplete security validation\n\n**Recommendation:**\n1. Check for group readable: `0o044` → `0o066`\n2. Also check writable permissions: `0o022`\n3. Verify owner is current user\n4. Check parent directory permissions\n\n**Priority:** MEDIUM"
+  },
+  {
+    "title": "[MEDIUM] M-5: Missing Input Sanitization for Metadata Fields",
+    "labels": ["security", "medium", "bug"],
+    "body": "**File:** `onepassword_mcp_server/server.py`\n**Lines:** 903-981 (destructive operations)\n\n**Description:**\nWhile item names are validated with regex, optional fields like `notes`, `website_url` have minimal validation:\n\n```python\nnotes: Optional[str] = Field(None, max_length=2048)  # ❌ No content validation\nwebsite_url: Optional[str] = Field(None, max_length=512)  # ❌ No URL validation\n```\n\n**Impact:**\n- Injection attacks possible in notes field\n- Invalid URLs accepted\n- Potential XSS if notes are rendered in UI\n- Database issues with special characters\n\n**Recommendation:**\n1. Validate URL format for `website_url`\n2. Sanitize notes field (remove control characters)\n3. Add content-type validation\n4. Implement maximum line length for notes\n\n**Priority:** MEDIUM"
+  },
+  {
+    "title": "[MEDIUM] M-6: No Timeout on Destructive Operations",
+    "labels": ["security", "medium", "enhancement"],
+    "body": "**File:** `onepassword_mcp_server/server.py`\n**Lines:** 993-1369\n\n**Description:**\nDestructive operations don't have additional timeout or confirmation beyond the simple string check:\n\n```python\n@validator('confirmation')\ndef validate_confirmation(cls, v):\n    if v != \"DELETE\":  # ❌ Too simple\n        raise ValueError(\"Confirmation must be exactly 'DELETE' to proceed\")\n    return v\n```\n\n**Impact:**\n- Accidental deletion possible\n- No \"cooling off\" period\n- No additional verification\n- Simple typo protection only\n\n**Recommendation:**\n1. Implement two-step confirmation (require typing item name)\n2. Add mandatory delay (e.g., 5 seconds) before deletion\n3. Send confirmation email/notification\n4. Implement \"soft delete\" with recovery period\n\n**Priority:** MEDIUM"
+  },
+  {
+    "title": "[MEDIUM] M-7: Correlation IDs Predictable (UUID4)",
+    "labels": ["security", "medium", "enhancement"],
+    "body": "**File:** `onepassword_mcp_server/structured_logging.py`\n**Lines:** 270, `server.py` line 288\n\n**Description:**\nCorrelation IDs use UUID4 but are predictable within a single process:\n\n```python\ncorrelation_id_value = correlation_id_value or str(uuid.uuid4())\n```\n\n**Impact:**\n- Correlation ID collision possible (low probability)\n- Request tracking may be confused\n- Not suitable for security-sensitive use\n\n**Recommendation:**\n1. Use `secrets.token_hex()` for cryptographically secure IDs\n2. Add process ID and timestamp to ensure uniqueness\n3. Consider using UUIDv7 (time-ordered)\n\n**Priority:** MEDIUM"
+  },
+  {
+    "title": "[MEDIUM] M-8: Environment Validation Warnings Not Enforced",
+    "labels": ["security", "medium", "bug"],
+    "body": "**File:** `onepassword_mcp_server/security_hardening.py`\n**Lines:** 408-422\n\n**Description:**\nEnvironment validation issues are collected but only returned as warnings, never enforced:\n\n```python\nfor indicator in debug_indicators:\n    value = os.getenv(indicator, \"\").lower()\n    if value in [\"1\", \"true\", \"yes\", \"on\", \"development\", \"debug\", \"test\"]:\n        issues.append(f\"Debug/development indicator found: {indicator}={value}\")\n        # ❌ No enforcement, just warning\n```\n\n**Impact:**\n- Production deployment with debug mode possible\n- Security warnings ignored\n- No fail-safe mechanism\n\n**Recommendation:**\n1. Make validation failures fatal in production mode\n2. Add strict mode that enforces all checks\n3. Require explicit override flag for warnings\n4. Log security validation results prominently\n\n**Priority:** MEDIUM"
+  },
+  {
+    "title": "[MEDIUM] M-9: Weak Token Validation",
+    "labels": ["security", "medium", "bug"],
+    "body": "**File:** `onepassword_mcp_server/config.py`\n**Lines:** 192-196\n\n**Description:**\nService account token validation is minimal:\n\n```python\nif len(self.service_account_token) < self.security.token_min_length:\n    raise ValueError(f\"Service account token must be at least {self.security.token_min_length} characters\")\n\nif not self.service_account_token.startswith(self.security.token_prefix):\n    logging.warning(f\"Service account token does not start with expected prefix '{self.security.token_prefix}'\")\n    # ❌ Only a warning, not an error\n```\n\n**Impact:**\n- Invalid tokens accepted\n- Typos in configuration not caught early\n- Delayed failure at API call time\n\n**Recommendation:**\n1. Make prefix check required, not optional\n2. Validate token format (e.g., base64, specific structure)\n3. Add checksum validation if available\n4. Test token validity at startup\n\n**Priority:** MEDIUM"
+  },
+  {
+    "title": "[MEDIUM] M-10: Missing Security Headers Documentation",
+    "labels": ["security", "medium", "enhancement", "documentation"],
+    "body": "**File:** `onepassword_mcp_server/security_hardening.py`\n**Lines:** 435-445\n\n**Description:**\nSecurity headers are defined but never actually used in the server:\n\n```python\ndef get_security_headers(self) -> Dict[str, str]:\n    return {\n        \"Strict-Transport-Security\": \"max-age=31536000; includeSubDomains\",\n        # ... etc\n    }\n    # ❌ Never called or applied\n```\n\n**Impact:**\n- Security headers not applied to responses\n- Missing CORS protection\n- No XSS protection\n- Dead code\n\n**Recommendation:**\n1. Implement middleware to apply security headers\n2. Document which headers apply to which transport\n3. Remove unused code or implement fully\n4. Add CSP configuration\n\n**Priority:** MEDIUM"
+  },
+  {
+    "title": "[LOW] L-1: Metrics Leak Internal Topology",
+    "labels": ["security", "low", "enhancement"],
+    "body": "**File:** `onepassword_mcp_server/server.py`\n**Lines:** 869-898\n\n**Description:**\nMetrics expose detailed internal information without authentication:\n\n```python\nasync def get_metrics_impl() -> Dict[str, Any]:\n    # Returns all metrics without auth check\n    dashboard_data = await dashboard.get_dashboard_data()\n```\n\n**Impact:**\n- Information disclosure about system performance\n- Reveals request patterns and usage\n- Could aid in timing attacks\n\n**Recommendation:**\n1. Add authentication to metrics endpoint\n2. Provide different metrics for different roles\n3. Sanitize metric names to avoid leaking internals\n4. Add configuration for metrics visibility\n\n**Priority:** LOW"
+  },
+  {
+    "title": "[LOW] L-2: Hardcoded Credential Lifetime",
+    "labels": ["security", "low", "enhancement"],
+    "body": "**File:** `onepassword_mcp_server/security_hardening.py`\n**Lines:** 69, 176\n\n**Description:**\nCredential maximum lifetime is hardcoded:\n\n```python\ncredential_max_lifetime_seconds: int = 300  # 5 minutes\n# ...\nself._max_lifetime = 300  # 5 minutes default\n```\n\n**Impact:**\n- Cannot adjust based on use case\n- May be too long or too short for different scenarios\n- Not configurable per credential type\n\n**Recommendation:**\n1. Make configurable via environment variable\n2. Support per-operation lifetime configuration\n3. Add ability to refresh/extend lifetime\n4. Document lifetime implications\n\n**Priority:** LOW"
+  },
+  {
+    "title": "[LOW] L-3: Logging Configuration Exposes Debug State",
+    "labels": ["security", "low", "bug"],
+    "body": "**File:** `onepassword_mcp_server/config.py`\n**Lines:** 255-260\n\n**Description:**\nThe logging configuration accepts any string value and only warns on unknown values:\n\n```python\ntry:\n    log_level = LogLevel(log_level_str)\nexcept ValueError:\n    logging.warning(f\"Unknown log level '{log_level_str}', defaulting to INFO\")\n    log_level = LogLevel.INFO\n```\n\n**Impact:**\n- Misconfiguration silently ignored\n- May run in unexpected log level\n- Production systems with debug logging\n\n**Recommendation:**\n1. Fail fast on invalid log levels in production\n2. Add strict mode for configuration validation\n3. Validate in CI/CD pipeline\n4. Default to WARNING in production, INFO in development\n\n**Priority:** LOW"
+  },
+  {
+    "title": "[LOW] L-4: Circuit Breaker State Change Logging",
+    "labels": ["security", "low", "enhancement"],
+    "body": "**File:** `onepassword_mcp_server/resilience.py`\n**Lines:** 138-154\n\n**Description:**\nCircuit breaker state changes log at INFO/WARNING but these are security-relevant events that should be logged at higher severity:\n\n```python\ndef _open_circuit(self):\n    self.state = CircuitState.OPEN\n    self.stats.circuit_open_count += 1\n    logger.warning(\"Circuit breaker opened due to failures\")  # ❌ Should be ERROR\n```\n\n**Impact:**\n- Important security events may be missed\n- Alert thresholds may not trigger\n- Incident response delayed\n\n**Recommendation:**\n1. Log circuit open at ERROR level\n2. Log circuit close at WARNING level\n3. Add audit logging for state changes\n4. Include failure context in logs\n\n**Priority:** LOW"
+  },
+  {
+    "title": "[LOW] L-5: Missing Dependency Version Pinning",
+    "labels": ["security", "low", "enhancement", "dependencies"],
+    "body": "**File:** `pyproject.toml`\n**Lines:** 37-42\n\n**Description:**\nDependencies use minimum version constraints only:\n\n```toml\ndependencies = [\n    \"mcp[cli]>=1.6.0\",           # ❌ No upper bound\n    \"onepassword-sdk>=0.2.1\",    # ❌ No upper bound\n    \"pydantic>=2.5.0\",           # ❌ No upper bound\n    \"cryptography>=41.0.0\",      # ❌ No upper bound\n]\n```\n\n**Impact:**\n- Breaking changes in dependencies possible\n- Security vulnerabilities in newer versions\n- Inconsistent builds across environments\n\n**Recommendation:**\n1. Use lock file (uv.lock exists - good!)\n2. Consider upper bounds for major versions\n3. Regular dependency audits\n4. Automated dependency updates with testing\n\n**Priority:** LOW"
+  },
+  {
+    "title": "[INFO] I-1: Unused CORS Configuration",
+    "labels": ["documentation", "informational", "cleanup"],
+    "body": "**File:** `onepassword_mcp_server/security_hardening.py`\n**Lines:** 97-105, 365-386\n\n**Description:**\nCORS configuration exists but MCP server uses stdio transport, not HTTP:\n\n```python\n# CORS configuration\ncors_enabled: bool = True\nallowed_origins: List[str] = field(default_factory=lambda: [\"https://localhost\"])\n# ...\n# ❌ Never used since server uses stdio, not HTTP\n```\n\n**Impact:**\n- Confusing configuration\n- Dead code\n- May mislead developers\n\n**Recommendation:**\n1. Document that CORS is for future HTTP transport\n2. Remove if HTTP transport not planned\n3. Add feature flag for HTTP transport\n4. Update documentation\n\n**Priority:** INFORMATIONAL"
+  },
+  {
+    "title": "[INFO] I-2: Inconsistent Naming Conventions",
+    "labels": ["documentation", "informational", "cleanup"],
+    "body": "**File:** Multiple files\n\n**Description:**\nInconsistent naming between `service_account_token` and `OP_SERVICE_ACCOUNT_TOKEN`:\n\n- Config uses `service_account_token`\n- Environment uses `OP_SERVICE_ACCOUNT_TOKEN`\n- Some docs say just `SERVICE_ACCOUNT_TOKEN`\n\n**Impact:**\n- Confusion for developers\n- Documentation inconsistencies\n- Potential configuration errors\n\n**Recommendation:**\n1. Standardize on one naming convention\n2. Update all documentation\n3. Consider aliases for backward compatibility\n\n**Priority:** INFORMATIONAL"
+  },
+  {
+    "title": "[INFO] I-3: Missing Rate Limit Headers in Responses",
+    "labels": ["enhancement", "informational", "ux"],
+    "body": "**File:** `onepassword_mcp_server/server.py`\n**Lines:** 127-152\n\n**Description:**\nRate limiting is implemented but clients aren't informed about:\n- Current limit\n- Remaining requests\n- Reset time\n\n**Impact:**\n- Clients cannot implement backoff\n- Poor user experience\n- Unnecessary retry attempts\n\n**Recommendation:**\n1. Add rate limit info to response metadata\n2. Implement standard rate limit headers (X-RateLimit-*)\n3. Document rate limiting behavior\n4. Provide retry-after information\n\n**Priority:** INFORMATIONAL"
+  }
+]
